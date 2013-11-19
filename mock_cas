@@ -1,0 +1,269 @@
+#!/usr/bin/env ruby
+
+# Listening port number for the Mock CAS Server
+$port = 8001
+# The MOCK_CAS_PORT environment variable may be used to override the listening port number
+if ENV["MOCK_CAS_PORT"] and not ENV["MOCK_CAS_PORT"].nil? and not ENV["MOCK_CAS_PORT"].empty?
+  $port = ENV["MOCK_CAS_PORT"].to_i
+end
+# This script is currently hard-coded to listen only on 127.0.0.1 and ::1
+
+# Default attribute values
+$default_attributes = {
+  'user' => 'mock_user',
+  'auth_type' => 'password',
+  'first' => 'First', 'middle' => 'M.', 'last' => 'Last',
+  'email' => 'mock_cas_user@example.com',
+  'phone' => '123-456-7890',
+}
+
+# Configure handling of non-gateway authentication requests
+# If false, display a "login" form that permits editing the default attributes before logging in
+# If true, skip the "login" form and tell the app the user is logged in with the default attributes
+$login_as_default_user = false
+if ENV['MOCK_CAS_AUTO_LOGIN'] and not ENV['MOCK_CAS_AUTO_LOGIN'].nil? and
+   ENV['MOCK_CAS_AUTO_LOGIN'].downcase.start_with? 'y'
+  $login_as_default_user = true
+end
+
+# Configure handling of gateway authentication requests
+# If false, tell the app the user is not logged in
+# If true, tell the app the user is logged in with the default attributes
+$gateway_as_default_user = true
+
+# MOCK_CAS_PROXY_HOST and MOCK_CAS_PROXY_PORT environment variables may be configured to use an
+# outbound proxy for PGT callbacks to the app
+if ENV['MOCK_CAS_PROXY_HOST'] and ENV['MOCK_CAS_PROXY_PORT'] and
+   not ENV['MOCK_CAS_PROXY_HOST'].nil? and not ENV['MOCK_CAS_PROXY_PORT'].nil? and
+   not ENV['MOCK_CAS_PROXY_HOST'].empty? and not ENV['MOCK_CAS_PROXY_PORT'].empty?
+  $outbound_proxy_host = ENV['MOCK_CAS_PROXY_HOST']
+  $outbound_proxy_port = ENV['MOCK_CAS_PROXY_PORT']
+end
+
+# Uncomment to test the calling application's handling of PGT callback failures
+#$induce_pgt_callback_failure = true
+
+
+
+puts ''
+puts 'Mock CAS'
+puts "Configured to use outbound proxy #{$outbound_proxy_host}:#{$outbound_proxy_port} for PGT callbacks" if $outbound_proxy_host and $outbound_proxy_port
+puts 'Configured to induce PGT callback failures' if $induce_pgt_callback_failure
+puts 'Configured to handle non-gateway auth requests with ' + ($login_as_default_user ? 'automatic login using default attributes' : 'login form')
+puts 'Configured to handle gateway auth requests as ' + ($gateway_as_default_user ? 'logged in with default attributes' : 'not logged in')
+puts ''
+puts "Configure your app to use \"http://localhost:#{$port}/cas\" as the CAS Base URL"
+puts ''
+
+require 'webrick'
+require 'webrick/log'
+require 'securerandom'
+require 'net/http'
+
+$log = WEBrick::Log::new
+webrick_options = {:Port => $port, :Logger => $log}
+if $outbound_proxy_host and $outbound_proxy_port
+  $http = Net::HTTP::Proxy($outbound_proxy_host, $outbound_proxy_port)
+else
+  $http = Net::HTTP
+end
+
+# TODO: Unused tickets are not expired until this process is restarted
+$service_tickets = {}
+$proxy_granting_tickets = {}
+$proxy_tickets = {}
+
+# TODO: Only the CAS2.0 protocol is currently supported (SAML is not supported)
+def handler(req, res)
+
+  # Login Page Request (from Client)
+  # Credentials are not remembered, so the login page is displayed every time the app redirects to
+  # CAS, and the 'renew' parameter is ignored
+  if (req.request_method == 'GET' or req.request_method == 'POST') and req.path =~ %r!^/cas/login/?$!
+    # Parse the service parameter provided by the app
+    service = req.query_string.match('service=([^&]+)')[1] rescue nil
+    raise WEBrick::HTTPStatus::BadRequest, '"service" parameter must be specified' if service.nil? or service.empty?
+    service = URI.unescape(service) rescue raise(WEBrick::HTTPStatus::BadRequest, 'Invalid "service" parameter specified')
+
+    # Handle login form submission
+    if req.request_method == 'POST'
+      attrs = req.query
+
+    # Handle gateway authentication
+    elsif req.query_string.match('gateway=')
+      return res.set_redirect WEBrick::HTTPStatus::SeeOther, service unless $gateway_as_default_user
+      attrs = $default_attributes
+
+    # Handle automatic authentication
+    elsif $login_as_default_user
+      attrs = $default_attributes
+    end
+
+    # Redirect back to app with a Service Ticket
+    # The Service Ticket and associated user attributes are stored in-memory only
+    unless attrs.nil?
+      service_ticket = 'ST-' + SecureRandom.urlsafe_base64(16)
+      $service_tickets[service_ticket] = attrs.merge(:service => service.dup)
+      service << "#{service !~ /\?/ ? '?' : '&'}ticket=#{service_ticket}"
+      return res.set_redirect WEBrick::HTTPStatus::SeeOther, service
+    end
+
+    # Display a form which lets the user enter attributes that will be passed to the application
+    return res.body = <<-END
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+<html><head><title>Mock CAS Login</title></head><body><form method="post" action="#{req.unparsed_uri}">
+  Username: <input name="user" type="text" size=40 value="#{$default_attributes['user']}" autocorrect="off" autocapitalize="off"/><br/>
+  <br/>
+  Login Type:<br/>
+    <input type="radio" name="auth_type" value="password"#{$default_attributes['auth_type'] == 'password' ? ' checked' : ''}>
+      User ID & Password<br/>
+  <br/>
+  Name (First, Middle, Last): <input name="first" type="text" value="#{$default_attributes['first']}" autocorrect="off" autocapitalize="off"/>
+    <input name="middle" type="text" value="#{$default_attributes['middle']}" autocorrect="off" autocapitalize="off"/>
+    <input name="last" type="text" value="#{$default_attributes['last']}" autocorrect="off" autocapitalize="off"/><br/>
+  EMail: <input name="email" type="text" size=40 value="#{$default_attributes['email']}" autocorrect="off" autocapitalize="off"/><br/>
+  Phone Number: <input name="phone" type="text" size=15 value="#{$default_attributes['phone']}" autocorrect="off" autocapitalize="off"/><br/>
+  <br/>
+  <input type="submit" value="Login" />
+</form></body></html>
+    END
+  end
+
+  # Logout Request (from Client)
+  # Since credentials are not remembered, this simply displays a confirmation page
+  # TODO: We're violating the CAS protocol spec by not expiring PGTs when the client logs out
+  # TODO: Application Single-Sign-Out is not currently supported
+  if req.request_method == 'GET' and req.path =~ %r!^/cas/logout/?$!
+    return res.body = <<-END
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+<html><head><title>Mock CAS Logout</title></head><body>
+  You have successfully logged out.
+</body></html>
+    END
+  end
+
+  # Service Validate or Proxy Validate Request (from App)
+  # The 'renew' parameter is ignored since credentials are not remembered
+  # The provided 'pgtUrl' may use plain HTTP (This is a violation of the CAS protocol spec)
+  if req.request_method == 'GET' and req.path =~ %r!^/cas/(service|proxy)Validate/?$!
+    # Parse the parameters provided by the app
+    service = req.query_string.match('service=([^&]+)')[1] rescue nil
+    return res.body = cas_error('INVALID_REQUEST', '"service" parameter must be specified') if service.nil? or service.empty?
+    service = URI.unescape(service) rescue nil
+    return res.body = cas_error('INVALID_REQUEST', 'Invalid "service" parameter specified') if service.nil?
+    ticket = req.query_string.match('ticket=([^&]+)')[1] rescue nil
+    return res.body = cas_error('INVALID_REQUEST', '"ticket" parameter must be specified') if ticket.nil? or ticket.empty?
+    pgturl = URI.unescape(req.query_string.match('pgtUrl=([^&]+)')[1]) rescue nil
+
+    # Look up the Service or Proxy Ticket
+    attrs = $service_tickets.delete(ticket)
+    attrs = pt_attrs = $proxy_tickets.delete(ticket) if attrs.nil?
+    return res.body = cas_error('INVALID_TICKET', 'Ticket is not recognized') if attrs.nil? or (!pt_attrs.nil? and req.path !~ /proxyValidate/)
+    return res.body = cas_error('INVALID_SERVICE', '"service" parameter is not the same as was used to issue this ticket') if attrs.delete(:service) != service
+
+    # If requested, generate a Proxy Granting Ticket
+    if pgturl and !$induce_pgt_callback_failure
+      pgtiou = 'PGTIOU-' + SecureRandom.urlsafe_base64(16)
+      pgt = 'PGT-' + SecureRandom.urlsafe_base64(16)
+      pgt_resp = $http.get_response(URI("#{pgturl}#{pgturl !~ /\?/ ? '?' : '&'}pgtIou=#{pgtiou}&pgtId=#{pgt}"))
+      redirects = 1
+      while pgt_resp.is_a?(Net::HTTPRedirection) and redirects < 10 do
+        location = pgt_resp['location']
+        pgt_resp = $http.get_response(URI(location))
+        redirects += 1
+      end
+      if pgt_resp.is_a?(Net::HTTPSuccess)
+        pgt_attrs = attrs.dup
+        pgt_attrs[:pgturls] = [] unless pgt_attrs.has_key?(:pgturls)
+        pgt_attrs[:pgturls].unshift(pgturl)
+        $proxy_granting_tickets[pgt] = pgt_attrs
+      else
+        puts "PGT Callback Failed: #{pgt_resp.inspect}"
+        pgtiou = nil
+      end
+    end
+
+    return res.body = cas_success(attrs, pgtiou)
+  end
+
+  # Proxy Ticket Request (from App)
+  if req.request_method == 'GET' and req.path =~ %r!^/cas/proxy/?$!
+    # Parse the parameters provided by the app
+    pgt = req.query_string.match('pgt=([^&]+)')[1] rescue nil
+    return res.body = cas_error('INVALID_REQUEST', '"pgt" parameter must be specified') if pgt.nil? or pgt.empty?
+    service = req.query_string.match('targetService=([^&]+)')[1] rescue nil
+    return res.body = cas_error('INVALID_REQUEST', '"targetService" parameter must be specified') if service.nil? or service.empty?
+    service = URI.unescape(service) rescue nil
+    return res.body = cas_error('INVALID_REQUEST', 'Invalid "targetService" parameter specified') if service.nil?
+
+    # Look up the Proxy Granting Ticket
+    attrs = $proxy_granting_tickets[pgt]
+    return res.body = cas_error('BAD_PGT', 'Proxy Granting Ticket is not recognized') if attrs.nil?
+
+    # Generate a Proxy Ticket
+    proxy_ticket = 'PT-' + SecureRandom.urlsafe_base64(16)
+    $proxy_tickets[proxy_ticket] = attrs.merge(:service => service.dup)
+    return res.body = cas_proxy_ticket(proxy_ticket)
+  end
+
+  raise WEBrick::HTTPStatus::NotFound, "\"#{req.unparsed_uri}\" does not exist"
+end
+
+def cas_success(a, pgtiou)
+  auth_method = case a['auth_type']
+    when 'password' then 'urn:oasis:names:tc:SAML:1.0:am:password'
+  end
+  top = <<-END
+<cas:serviceResponse xmlns:cas='http://www.yale.edu/tp/cas'>
+  <cas:authenticationSuccess>
+    <cas:user>#{a['user']}</cas:user>
+  END
+  pgtiou = "    <cas:proxyGrantingTicket>#{pgtiou}</cas:proxyGrantingTicket>\n" unless pgtiou.nil?
+  if a.has_key?(:pgturls)
+    proxies = "    <cas:proxies>\n"
+    a[:pgturls].each { |p| proxies << "      <cas:proxy>#{p}</cas:proxy>\n" }
+    proxies << "    </cas:proxies>\n"
+  end
+  bottom = <<-END
+    <cas:attributes>
+      <cas:samlAuthenticationStatementAuthMethod>#{auth_method}</cas:samlAuthenticationStatementAuthMethod>
+      <cas:First-Name>#{a['first']}</cas:First-Name>
+      <cas:Middle-Name>#{a['middle']}</cas:Middle-Name>
+      <cas:Last-Name>#{a['last']}</cas:Last-Name>
+      <cas:Email-Address>#{a['email']}</cas:Email-Address>
+      <cas:Phone>#{a['phone']}</cas:Phone>
+    </cas:attributes>
+  </cas:authenticationSuccess>
+</cas:serviceResponse>
+  END
+  "#{top}#{pgtiou}#{proxies}#{bottom}"
+end
+
+def cas_proxy_ticket(proxy_ticket)
+  body = <<-END
+<cas:serviceResponse xmlns:cas='http://www.yale.edu/tp/cas'>
+  <cas:proxySuccess>
+    <cas:proxyTicket>#{proxy_ticket}</cas:proxyTicket>
+  </cas:proxySuccess>
+</cas:serviceResponse>
+  END
+end
+
+def cas_error(code, message)
+  body = <<-END
+<cas:serviceResponse xmlns:cas='http://www.yale.edu/tp/cas'>
+  <cas:authenticationFailure code="#{code}">
+    #{message}
+  </cas:authenticationFailure>
+</cas:serviceResponse>
+  END
+end
+
+# Start WEBrick on both IPv4 and IPv6
+server_v4 = WEBrick::HTTPServer.new(webrick_options.merge(:BindAddress => '127.0.0.1'))
+server_v6 = WEBrick::HTTPServer.new(webrick_options.merge(:BindAddress => '::1'))
+trap 'INT' do server_v4.shutdown ; server_v6.shutdown end
+server_v4.mount_proc '/cas' do |req, res| handler(req, res) end
+server_v6.mount_proc '/cas' do |req, res| handler(req, res) end
+Thread.start { server_v4.start }
+server_v6.start
