@@ -83,7 +83,7 @@ def handler(req, res)
     # Parse the service parameter provided by the app
     service = req.query_string.match('service=([^&]+)')[1] rescue nil
     raise WEBrick::HTTPStatus::BadRequest, '"service" parameter must be specified' if service.nil? or service.empty?
-    service = URI.unescape(service) rescue raise(WEBrick::HTTPStatus::BadRequest, 'Invalid "service" parameter specified')
+    service = CGI::unescape(service) rescue raise(WEBrick::HTTPStatus::BadRequest, 'Invalid "service" parameter specified')
 
     # Handle login form submission
     if req.request_method == 'POST'
@@ -149,11 +149,11 @@ def handler(req, res)
     # Parse the parameters provided by the app
     service = req.query_string.match('service=([^&]+)')[1] rescue nil
     return res.body = cas_error('INVALID_REQUEST', '"service" parameter must be specified') if service.nil? or service.empty?
-    service = URI.unescape(service) rescue nil
+    service = CGI::unescape(service) rescue nil
     return res.body = cas_error('INVALID_REQUEST', 'Invalid "service" parameter specified') if service.nil?
     ticket = req.query_string.match('ticket=([^&]+)')[1] rescue nil
     return res.body = cas_error('INVALID_REQUEST', '"ticket" parameter must be specified') if ticket.nil? or ticket.empty?
-    pgturl = URI.unescape(req.query_string.match('pgtUrl=([^&]+)')[1]) rescue nil
+    pgturl = CGI::unescape(req.query_string.match('pgtUrl=([^&]+)')[1]) rescue nil
 
     # Look up the Service or Proxy Ticket
     attrs = $service_tickets.delete(ticket)
@@ -193,7 +193,7 @@ def handler(req, res)
     return res.body = cas_error('INVALID_REQUEST', '"pgt" parameter must be specified') if pgt.nil? or pgt.empty?
     service = req.query_string.match('targetService=([^&]+)')[1] rescue nil
     return res.body = cas_error('INVALID_REQUEST', '"targetService" parameter must be specified') if service.nil? or service.empty?
-    service = URI.unescape(service) rescue nil
+    service = CGI::unescape(service) rescue nil
     return res.body = cas_error('INVALID_REQUEST', 'Invalid "targetService" parameter specified') if service.nil?
 
     # Look up the Proxy Granting Ticket
